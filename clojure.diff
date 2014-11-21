@@ -1,0 +1,287 @@
+commit 08bc567306f07419602b28d63db2f89ac62de231
+Author: Arne Brasseur <arne@arnebrasseur.net>
+Date:   Fri Nov 21 12:50:29 2014 +0100
+
+    Apply feature expressions patch, see http://dev.clojure.org/jira/browse/CLJ-1424 (clj-1424-v3.diff)
+
+diff --git a/pom.xml b/pom.xml
+index 1d17f3a..45a6fec 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -5,7 +5,7 @@
+   <artifactId>clojure</artifactId>
+   <name>clojure</name>
+   <packaging>jar</packaging>
+-  <version>1.7.0-master-SNAPSHOT</version>
++  <version>1.7.0-fx</version>
+ 
+   <url>http://clojure.org/</url>
+   <description>Clojure core environment and runtime library.</description>
+diff --git a/src/clj/clojure/main.clj b/src/clj/clojure/main.clj
+index 48c357d..a87d198 100644
+--- a/src/clj/clojure/main.clj
++++ b/src/clj/clojure/main.clj
+@@ -53,6 +53,7 @@
+   [^StackTraceElement el]
+   (let [file (.getFileName el)
+         clojure-fn? (and file (or (.endsWith file ".clj")
++                                  (.endsWith file ".cljc")
+                                   (= file "NO_SOURCE_FILE")))]
+     (str (if clojure-fn?
+            (demunge (.getClassName el))
+diff --git a/src/clj/clojure/repl.clj b/src/clj/clojure/repl.clj
+index 7c412d4..0547594 100644
+--- a/src/clj/clojure/repl.clj
++++ b/src/clj/clojure/repl.clj
+@@ -216,6 +216,7 @@ str-or-pattern."
+   [^StackTraceElement el]
+   (let [file (.getFileName el)
+         clojure-fn? (and file (or (.endsWith file ".clj")
++                                  (.endsWith file ".cljc")
+                                   (= file "NO_SOURCE_FILE")))]
+     (str (if clojure-fn?
+            (demunge (.getClassName el))
+diff --git a/src/jvm/clojure/lang/LispReader.java b/src/jvm/clojure/lang/LispReader.java
+index b926a12..bf679fa 100644
+--- a/src/jvm/clojure/lang/LispReader.java
++++ b/src/jvm/clojure/lang/LispReader.java
+@@ -108,6 +108,8 @@ static
+ 	dispatchMacros['!'] = new CommentReader();
+ 	dispatchMacros['<'] = new UnreadableReader();
+ 	dispatchMacros['_'] = new DiscardReader();
++	dispatchMacros['+'] = new FeatureReader();
++	dispatchMacros['-'] = new FeatureReader();
+ 	}
+ 
+ static boolean isWhitespace(int ch){
+@@ -172,8 +174,6 @@ static public Object read(PushbackReader r, boolean eofIsError, Object eofValue,
+ 			if(Character.isDigit(ch))
+ 				{
+ 				Object n = readNumber(r, (char) ch);
+-				if(RT.suppressRead())
+-					return null;
+ 				return n;
+ 				}
+ 
+@@ -196,16 +196,12 @@ static public Object read(PushbackReader r, boolean eofIsError, Object eofValue,
+ 					{
+ 					unread(r, ch2);
+ 					Object n = readNumber(r, (char) ch);
+-					if(RT.suppressRead())
+-						return null;
+ 					return n;
+ 					}
+ 				unread(r, ch2);
+ 				}
+ 
+ 			String token = readToken(r, (char) ch);
+-			if(RT.suppressRead())
+-				return null;
+ 			return interpretToken(token);
+ 			}
+ 		}
+@@ -1161,6 +1157,10 @@ public static class CtorReader extends AFn{
+ 		if (!(name instanceof Symbol))
+ 			throw new RuntimeException("Reader tag must be a symbol");
+ 		Symbol sym = (Symbol)name;
++		if (RT.suppressRead()) {
++			read(r, true, null, true);
++			return r;
++		}
+ 		return sym.getName().contains(".") ? readRecord(r, sym) : readTagged(r, sym);
+ 	}
+ 
+@@ -1245,6 +1245,58 @@ public static class CtorReader extends AFn{
+ 	}
+ }
+ 
++public static class FeatureReader extends AFn {
++    static final Symbol AND = Symbol.intern("and");
++    static final Symbol NOT = Symbol.intern("not");
++    static final Symbol OR = Symbol.intern("or");
++
++    public static boolean hasFeature(Object expr) {
++        if (expr instanceof Symbol) {
++            IPersistentSet available = (IPersistentSet) RT.FEATURES.deref();
++            return available.contains(Keyword.intern((Symbol) expr));
++        } else if (expr instanceof IPersistentList) {
++            ISeq sequence = ((IPersistentList) expr).seq();
++            Symbol op = (Symbol) sequence.first();
++            if (op.equals(AND)) {
++                if (sequence.next() == null) return true;
++                for (Object feature: RT.seqToArray(sequence.more())) {
++                    if (!hasFeature(feature)) return false;
++                }
++                return true;
++            } else if (op.equals(NOT)) {
++                return !hasFeature(sequence.more().first());
++            } else if (op.equals(OR)) {
++                if (sequence.next() == null) return false;
++                for (Object feature: RT.seqToArray(sequence.more())) {
++                    if (hasFeature(feature)) return true;
++                }
++                return false;
++            }
++            throw Util.runtimeException("Invalid feature expression operator: " + op);
++        } else {
++            throw Util.runtimeException("Invalid feature expression: " + expr);
++        }
++    }
++
++    public Object invoke(Object reader, Object mode) {
++        PushbackReader r = (PushbackReader) reader;
++        Object test = read(r, true, null, true);
++        boolean include = (((Integer) mode).intValue() == (int)'+');
++        if (hasFeature(test) == include) {
++            return read(r, true, null, true);
++        } else {
++            try {
++                Var.pushThreadBindings(RT.map(RT.SUPPRESS_READ, RT.T));
++                read(r, true, null, true);
++            }
++            finally {
++                Var.popThreadBindings();
++            }
++            return r; // no-op, return the reader
++        }
++    }
++}
++
+ /*
+ public static void main(String[] args) throws Exception{
+ 	//RT.init();
+diff --git a/src/jvm/clojure/lang/RT.java b/src/jvm/clojure/lang/RT.java
+index c72eef3..b175783 100644
+--- a/src/jvm/clojure/lang/RT.java
++++ b/src/jvm/clojure/lang/RT.java
+@@ -176,6 +176,18 @@ static Object readTrueFalseUnknown(String s){
+ 	return Keyword.intern(null, "unknown");
+ }
+ 
++static IPersistentCollection readFeatureSet() {
++  IPersistentCollection features = RT.set(Keyword.intern(null, "clj"));
++  String[] featureStrs = System.getProperty("clojure.features","").split(",");
++  for(String feature : featureStrs) {
++    String featureTrim = feature.trim();
++    if(featureTrim.length() > 0) {
++      features = features.cons(Keyword.intern(null, featureTrim));
++    }
++  }
++  return features;
++}
++
+ static public final Namespace CLOJURE_NS = Namespace.findOrCreate(Symbol.intern("clojure.core"));
+ //static final Namespace USER_NS = Namespace.findOrCreate(Symbol.intern("user"));
+ final static public Var OUT =
+@@ -194,6 +206,8 @@ final static public Var READEVAL = Var.intern(CLOJURE_NS, Symbol.intern("*read-e
+ final static public Var DATA_READERS = Var.intern(CLOJURE_NS, Symbol.intern("*data-readers*"), RT.map()).setDynamic();
+ final static public Var DEFAULT_DATA_READER_FN = Var.intern(CLOJURE_NS, Symbol.intern("*default-data-reader-fn*"), RT.map()).setDynamic();
+ final static public Var DEFAULT_DATA_READERS = Var.intern(CLOJURE_NS, Symbol.intern("default-data-readers"), RT.map());
++final static public Var SUPPRESS_READ = Var.intern(CLOJURE_NS, Symbol.intern("*suppress-read*"), null).setDynamic();
++final static public Var FEATURES = Var.intern(CLOJURE_NS, Symbol.intern("*features*"), readFeatureSet()).setDynamic();
+ final static public Var ASSERT = Var.intern(CLOJURE_NS, Symbol.intern("*assert*"), T).setDynamic();
+ final static public Var MATH_CONTEXT = Var.intern(CLOJURE_NS, Symbol.intern("*math-context*"), null).setDynamic();
+ static Keyword LINE_KEY = Keyword.intern(null, "line");
+@@ -414,13 +428,18 @@ static public void load(String scriptbase) throws IOException, ClassNotFoundExce
+ static public void load(String scriptbase, boolean failIfNotFound) throws IOException, ClassNotFoundException{
+ 	String classfile = scriptbase + LOADER_SUFFIX + ".class";
+ 	String cljfile = scriptbase + ".clj";
++    String scriptfile = cljfile;
+ 	URL classURL = getResource(baseLoader(),classfile);
+-	URL cljURL = getResource(baseLoader(), cljfile);
++	URL cljURL = getResource(baseLoader(), scriptfile);
++    if(cljURL == null) {
++        scriptfile = scriptbase + ".cljc";
++        cljURL = getResource(baseLoader(), scriptfile);
++    }
+ 	boolean loaded = false;
+ 
+ 	if((classURL != null &&
+ 	    (cljURL == null
+-	     || lastModified(classURL, classfile) > lastModified(cljURL, cljfile)))
++	     || lastModified(classURL, classfile) > lastModified(cljURL, scriptfile)))
+ 	   || classURL == null) {
+ 		try {
+ 			Var.pushThreadBindings(
+@@ -435,9 +454,9 @@ static public void load(String scriptbase, boolean failIfNotFound) throws IOExce
+ 	}
+ 	if(!loaded && cljURL != null) {
+ 		if(booleanCast(Compiler.COMPILE_FILES.deref()))
+-			compile(cljfile);
++			compile(scriptfile);
+ 		else
+-			loadResourceScript(RT.class, cljfile);
++			loadResourceScript(RT.class, scriptfile);
+ 	}
+ 	else if(!loaded && failIfNotFound)
+ 		throw new FileNotFoundException(String.format("Could not locate %s or %s on classpath.%s", classfile, cljfile,
+@@ -1763,8 +1782,7 @@ static public String resolveClassNameInContext(String className){
+ }
+ 
+ static public boolean suppressRead(){
+-	//todo - look up in suppress-read var
+-	return false;
++       return booleanCast(SUPPRESS_READ.deref());
+ }
+ 
+ static public String printString(Object x){
+diff --git a/test/clojure/test_clojure/reader.clj b/test/clojure/test_clojure/reader.clj
+index ff0c04d..d6732a5 100644
+--- a/test/clojure/test_clojure/reader.clj
++++ b/test/clojure/test_clojure/reader.clj
+@@ -616,3 +616,55 @@
+   [^{:tag cgen/dup-readable} o]
+   (when-not (= o %)
+     (throw (ex-info "Value cannot roundtrip, see ex-data" {:printed o :read %}))))
++
++(deftest feature-expressions
++  (testing "#+"
++    (testing "with symbol"
++      (is (= ["x"] [#+clj "x"]))
++      (is (= [] [#+cljs "x"])))
++    (testing "with and"
++      (is (= ["x"] [#+(and) "x"]))
++      (is (= ["x"] [#+(and clj) "x"]))
++      (is (= ["x"] [#+(and clj clj) "x"]))
++      (is (= [] [#+(and clj cljs) "x"])))
++    (testing "with or"
++      (is (= [] [#+(or) "x"]))
++      (is (= ["x"] [#+(or clj) "x"]))
++      (is (= ["x"] [#+(or clj cljs) "x"]))
++      (is (= [] [#+(or cljs) "x"])))
++    (testing "with not"
++      (is (= ["x"] [#+(not cljs) "x"])))
++    (testing "with unreadable forms"
++      (is (= [] [#+cljs #js {:foo "bar"}]))
++      (is (= [] [#+cljs #js [1 2 3]]))
++      (is (= ["x"] [#+cljs [:foo #bar 123 :baz] #+clj "x"])))
++    (testing "with nested expressions"
++      (is (= [] [#+(not (and clj (or cljs (not cljs)))) "x"]))
++      (is (= ["x"] [#+(and clj (or cljs (not cljs))) "x"]))
++      (is (= ["x"] [#+(or cljs (or #+clj clj)) "x"]))))
++  (testing "#-"
++    (testing "with symbol"
++      (is (= [] [#-clj "x"]))
++      (is (= ["x"] [#-cljs "x"])))
++    (testing "with not"
++      (is (= ["x"] [#-(not clj) "x"])))
++    (testing "with and"
++      (is (= [] [#-(and) "x"]))
++      (is (= [] [#-(and clj clj) "x"]))
++      (is (= ["x"] [#-(and clj cljs) "x"])))
++    (testing "with or"
++      (is (= ["x"] [#-(or) "x"]))
++      (is (= [] [#-(or clj) "x"]))
++      (is (= [] [#-(or clj cljs) "x"]))
++      (is (= ["x"] [#-(or cljs) "x"])))
++    (testing "with nested expressions"
++      (is (= ["x"] [#-(not (and clj (or cljs (not cljs)))) "x"]))
++      (is (= [] [#-(and clj (or cljs (not cljs))) "x"]))
++      (is (= ["x"] [#-(or cljs (or #-clj clj)) "x"]))))
++  (testing "binding around read"
++    (is (= [:x] (binding [*features* #{:a :b}] (read-string "[#+(and a b) :x]")))))
++  (testing "bad feature expressions"
++    (is (thrown-with-msg? RuntimeException #"Invalid feature expression operator: xor"
++                          (read-string "[#+(xor clj cljs) 5]")))
++    (is (thrown-with-msg? RuntimeException #"Invalid feature expression: 5"
++                          (read-string "[#+5 5]")))))
